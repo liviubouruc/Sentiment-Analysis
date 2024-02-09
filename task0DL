@@ -1,0 +1,111 @@
+#%%
+import pandas as pd
+import numpy as np
+
+import json
+from nltk.stem import PorterStemmer
+
+import tensorflow as tf
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Embedding, Bidirectional, LSTM, Dense, Dropout, Conv1D, GlobalMaxPool1D
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+from gensim.models import Word2Vec
+
+#%%
+conv_ids = []
+utterances = []
+emotions = []
+speakers = []
+with open('train_dataset.json') as f:
+    data = json.load(f)
+    for conv_id in data['conversation']:
+        for utterance in data['conversation'][conv_id]:
+            conv_ids.append(conv_id)
+            utterances.append(utterance['text'])
+            speakers.append(utterance['speaker'])
+            emotions.append(utterance['emotion'])
+
+train_df = pd.DataFrame({'conv_id': conv_ids, 'utterance': utterances, 'speaker': speakers, 'emotion': emotions})
+
+conv_ids = []
+utterances = []
+emotions = []
+speakers = []
+with open('test_dataset.json') as f:
+    data = json.load(f)
+    for conv_id in data['conversation']:
+        for utterance in data['conversation'][conv_id]:
+            conv_ids.append(conv_id)
+            utterances.append(utterance['text'])
+            speakers.append(utterance['speaker'])
+            emotions.append(utterance['emotion'])
+
+test_df = pd.DataFrame({'conv_id': conv_ids, 'utterance': utterances, 'speaker': speakers, 'emotion': emotions})
+
+emotion_map = {'anger': 0, 'disgust': 1, 'fear': 2, 'joy': 3, 'sadness': 4, 'surprise': 5, 'neutral': 6}
+train_df['emotion_label'] = train_df['emotion'].map(emotion_map)
+test_df['emotion_label'] = test_df['emotion'].map(emotion_map)
+
+#%%
+def preprocess_text(text):
+    #text = text.lower()
+    #text = re.sub('[^\w\s]', '', text)
+    #tokens = word_tokenize(text)
+    stemmer = PorterStemmer()
+    stemmed_tokens = [stemmer.stem(token) for token in text.split()]
+    #return ' '.join(stemmed_tokens)
+    return stemmed_tokens
+
+train_df['processed_text'] = train_df['utterance'].apply(preprocess_text)
+test_df['processed_text'] = test_df['utterance'].apply(preprocess_text)
+
+
+#%%
+tokenizer = Tokenizer()
+tokenizer.fit_on_texts(list(train_df['processed_text']))
+total_words = len(tokenizer.word_index) + 1
+
+#%%
+train_input_seq = tokenizer.texts_to_sequences(train_df['processed_text'])
+test_input_seq = tokenizer.texts_to_sequences(test_df['processed_text'])
+
+max_sequence_length = max(len(seq) for seq in train_input_seq)
+
+train_padded_seq = pad_sequences(train_input_seq, maxlen=max_sequence_length)
+test_padded_seq = pad_sequences(test_input_seq, maxlen=max_sequence_length)
+
+#%%
+embedding_dim = 30
+
+word2vec_model = Word2Vec(train_df['processed_text'],
+                 vector_size=embedding_dim,
+                 workers=8,
+                 min_count=5)
+
+embedding_matrix = np.zeros((total_words, embedding_dim))
+
+for word, token in tokenizer.word_index.items():
+    if word2vec_model.wv.__contains__(word):
+        embedding_matrix[token] = word2vec_model.wv.__getitem__(word)
+
+print("Embedding Matrix Shape:", embedding_matrix.shape)
+
+#%%
+model = Sequential()
+model.add(Embedding(input_dim=total_words, output_dim=embedding_dim, weights=[embedding_matrix], input_length=max_sequence_length))
+model.add(Bidirectional(LSTM(30, return_sequences=True)))
+model.add(Bidirectional(LSTM(30, return_sequences=True)))
+model.add(Conv1D(30, 5, activation='relu'))
+model.add(GlobalMaxPool1D())
+model.add(Dense(16, activation='relu'))
+model.add(Dense(7, activation='softmax'))
+
+callbacks = [ReduceLROnPlateau(monitor='val_loss', patience=5, cooldown=0),
+             EarlyStopping(monitor='val_accuracy', min_delta=1e-4, patience=3)]
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.fit(train_padded_seq, train_df['emotion_label'], epochs=10, verbose=1, validation_data=(test_padded_seq, test_df['emotion_label']), callbacks=callbacks)
+model.evaluate(test_padded_seq, test_df['emotion_label'])
